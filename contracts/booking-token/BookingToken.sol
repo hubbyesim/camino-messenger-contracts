@@ -1,30 +1,43 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity 0.8.24;
-
+pragma solidity 0.8.25;
 // UUPS Proxy
-import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable/blob/v5.0.2/contracts/proxy/utils/Initializable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable/blob/v5.0.2/contracts/proxy/utils/UUPSUpgradeable.sol";
 
 // ERC721
-import { ERC721Upgradeable, IERC721 } from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
-import { ERC721URIStorageUpgradeable } from "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721URIStorageUpgradeable.sol";
-import { ERC721EnumerableUpgradeable } from "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721EnumerableUpgradeable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable/blob/v5.0.2/contracts/token/ERC721/ERC721Upgradeable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable/blob/v5.0.2/contracts/token/ERC721/extensions/ERC721URIStorageUpgradeable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable/blob/v5.0.2/contracts/token/ERC721/extensions/ERC721EnumerableUpgradeable.sol";
 
 // Access
-import { AccessControlUpgradeable } from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
-
-// Manager Interface
-import { ICMAccountManager } from "../manager/ICMAccountManager.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable/blob/v5.0.2/contracts/access/AccessControlUpgradeable.sol";
 
 // Utils
-import { Address } from "@openzeppelin/contracts/utils/Address.sol";
-import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/utils/Address.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/IERC20.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import { ReentrancyGuardUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+// ReentrancyGuard
+import "https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable/blob/v5.0.2/contracts/utils/ReentrancyGuardUpgradeable.sol";
+
+
+interface ICMAccountManager {
+    function isCMAccount(address account) external view returns (bool);
+}
 
 // Cancellable
 import { BookingTokenCancellable, CancellationProposalStatus } from "./BookingTokenCancellable.sol";
+
+interface IERC721Minimal {
+    function ownerOf(uint256 tokenId) external view returns (address);
+}
+
+// Option NFT linked to a booking
+struct BookingOptionRef {
+    address tokenContract;  // ERC-721 contract of the option
+    uint256 tokenId;        // option tokenId
+    bytes32 optionType;     // arbitrary type identifier, e.g. keccak256("EXTRA_BAGGAGE")
+}
 
 /**
  * @title BookingToken
@@ -126,6 +139,7 @@ contract BookingToken is
     }
 
     /// @custom:storage-location erc7201:camino.messenger.storage.BookingToken
+
     struct BookingTokenStorage {
         // CMAccountManager address
         address _manager;
@@ -137,6 +151,8 @@ contract BookingToken is
         mapping(uint256 tokenId => TokenReservation tokenReservation) _reservations;
         // BookingStatus of each token
         mapping(uint256 tokenId => BookingStatus status) _bookingStatus;
+        // Linked option tokens for each booking
+        mapping(uint256 tokenId => BookingOptionRef[] options) _bookingOptions;
     }
 
     // keccak256(abi.encode(uint256(keccak256("camino.messenger.storage.BookingToken")) - 1)) & ~bytes32(uint256(0xff));
@@ -188,6 +204,20 @@ contract BookingToken is
      * @param tokenId token id
      */
     event TokenReservationExpired(uint256 indexed tokenId);
+
+    event BookingOptionLinked(
+    uint256 indexed bookingTokenId,
+    address indexed optionContract,
+    uint256 indexed optionTokenId,
+    bytes32 optionType
+);
+
+event BookingOptionUnlinked(
+    uint256 indexed bookingTokenId,
+    address indexed optionContract,
+    uint256 indexed optionTokenId
+);
+
 
     /***************************************************
      *                    ERRORS                       *
@@ -279,6 +309,33 @@ contract BookingToken is
      */
     error UnexpectedNativePayment(uint256 amount);
 
+    /**
+    * @notice Caller is not the owner of the booking token.
+    *
+    * @param tokenId token id
+    * @param caller caller address
+    * @param owner actual owner address
+    */
+    error NotBookingOwner(uint256 tokenId, address caller, address owner);
+
+    /**
+    * @notice Option token must be owned by the same address as the booking owner.
+    *
+    * @param optionOwner owner of the option token
+    * @param bookingOwner owner of the booking token
+    */
+    error OptionMustBeOwnedByBookingOwner(address optionOwner, address bookingOwner);
+
+    /**
+    * @notice Option link not found when attempting to unlink.
+    *
+    * @param bookingTokenId booking token id
+    * @param optionContract option token contract
+    * @param optionTokenId option token id
+    */
+    error OptionLinkNotFound(uint256 bookingTokenId, address optionContract, uint256 optionTokenId);
+
+
     /***************************************************
      *                  MODIFIERS                      *
      ***************************************************/
@@ -300,7 +357,6 @@ contract BookingToken is
         __ERC721Enumerable_init();
         __ERC721URIStorage_init();
         __AccessControl_init();
-        __UUPSUpgradeable_init();
 
         _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
         _grantRole(UPGRADER_ROLE, upgrader);
@@ -381,7 +437,7 @@ contract BookingToken is
         _safeMint(msg.sender, tokenId);
         _setTokenURI(tokenId, uri);
 
-        // Store the reservation
+        //Store the reservation
         _reserve(
             tokenId,
             reservedFor,
@@ -555,6 +611,150 @@ contract BookingToken is
     function isCancellable(uint256 tokenId) public view virtual returns (bool) {
         BookingTokenStorage storage $ = _getBookingTokenStorage();
         return $._reservations[tokenId].cancellable;
+    }
+
+        /***************************************************
+     *             BOOKING OPTIONS LOGIC               *
+     ***************************************************/
+
+    /**
+     * @notice Links an existing option NFT to a booking token.
+     *
+     * Requirements:
+     * - `bookingTokenId` must exist.
+     * - `msg.sender` must be the booking owner (CM Account).
+     * - The option NFT must be owned by the same address as the booking owner.
+     *
+     * @param bookingTokenId The booking token id
+     * @param optionContract The ERC-721 contract of the option NFT
+     * @param optionTokenId The option token id
+     * @param optionType Arbitrary type identifier (e.g. keccak256("EXTRA_BAGGAGE"))
+     */
+    function linkOptionToBooking(
+        uint256 bookingTokenId,
+        address optionContract,
+        uint256 optionTokenId,
+        bytes32 optionType
+    ) external virtual onlyCMAccount(msg.sender) {
+        BookingTokenStorage storage $ = _getBookingTokenStorage();
+
+        // 1) Ensure booking exists and get owner
+        address bookingOwner = _requireOwned(bookingTokenId);
+
+        // 2) Require caller to be the booking owner
+        if (msg.sender != bookingOwner) {
+            revert NotBookingOwner(bookingTokenId, msg.sender, bookingOwner);
+        }
+
+        // 3) Ensure the option NFT is owned by the same owner (to keep things consistent)
+        address optionOwner = IERC721Minimal(optionContract).ownerOf(optionTokenId);
+        if (optionOwner != bookingOwner) {
+            revert OptionMustBeOwnedByBookingOwner(optionOwner, bookingOwner);
+        }
+
+        // 4) Store the link
+        $._bookingOptions[bookingTokenId].push(
+            BookingOptionRef({
+                tokenContract: optionContract,
+                tokenId: optionTokenId,
+                optionType: optionType
+            })
+        );
+
+        emit BookingOptionLinked(bookingTokenId, optionContract, optionTokenId, optionType);
+    }
+
+    /**
+     * @notice Unlinks an option NFT from a booking token.
+     *
+     * Requirements:
+     * - `bookingTokenId` must exist.
+     * - `msg.sender` must be the booking owner (CM Account).
+     *
+     * @param bookingTokenId The booking token id
+     * @param optionContract The ERC-721 contract of the option NFT
+     * @param optionTokenId The option token id
+     */
+    function unlinkOptionFromBooking(
+        uint256 bookingTokenId,
+        address optionContract,
+        uint256 optionTokenId
+    ) external virtual onlyCMAccount(msg.sender) {
+        BookingTokenStorage storage $ = _getBookingTokenStorage();
+
+        // 1) Ensure booking exists and get owner
+        address bookingOwner = _requireOwned(bookingTokenId);
+
+        // 2) Require caller to be the booking owner
+        if (msg.sender != bookingOwner) {
+            revert NotBookingOwner(bookingTokenId, msg.sender, bookingOwner);
+        }
+
+        // 3) Find and remove the link (swap & pop)
+        BookingOptionRef[] storage list = $._bookingOptions[bookingTokenId];
+        uint256 len = list.length;
+
+        for (uint256 i = 0; i < len; i++) {
+            if (list[i].tokenContract == optionContract && list[i].tokenId == optionTokenId) {
+                // Move last element into the slot to delete, then shrink array
+                list[i] = list[len - 1];
+                list.pop();
+
+                emit BookingOptionUnlinked(bookingTokenId, optionContract, optionTokenId);
+                return;
+            }
+        }
+
+        revert OptionLinkNotFound(bookingTokenId, optionContract, optionTokenId);
+    }
+
+    /**
+     * @notice Returns all option NFTs linked to a given booking.
+     *
+     * @param bookingTokenId The booking token id
+     * @return options Array of BookingOptionRef
+     */
+    function getBookingOptions(
+        uint256 bookingTokenId
+    ) external view virtual returns (BookingOptionRef[] memory options) {
+        BookingTokenStorage storage $ = _getBookingTokenStorage();
+        return $._bookingOptions[bookingTokenId];
+    }
+
+    /**
+     * @notice Returns the number of options linked to a booking.
+     *
+     * @param bookingTokenId The booking token id
+     * @return count Number of linked options
+     */
+    function getBookingOptionsCount(
+        uint256 bookingTokenId
+    ) external view virtual returns (uint256 count) {
+        BookingTokenStorage storage $ = _getBookingTokenStorage();
+        return $._bookingOptions[bookingTokenId].length;
+    }
+
+    /**
+     * @notice Returns a single option reference by index for a booking.
+     *
+     * @param bookingTokenId The booking token id
+     * @param index Index in the options array
+     * @return tokenContract Option NFT contract address
+     * @return optionTokenId Option token id
+     * @return optionType Option type identifier
+     */
+    function getBookingOptionAt(
+        uint256 bookingTokenId,
+        uint256 index
+    )
+        external
+        view
+        virtual
+        returns (address tokenContract, uint256 optionTokenId, bytes32 optionType)
+    {
+        BookingTokenStorage storage $ = _getBookingTokenStorage();
+        BookingOptionRef storage opt = $._bookingOptions[bookingTokenId][index];
+        return (opt.tokenContract, opt.tokenId, opt.optionType);
     }
 
     /***************************************************
